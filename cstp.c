@@ -188,6 +188,12 @@ static void append_mobile_headers(struct openconnect_info *vpninfo, struct oc_te
 	}
 }
 
+#if GNUTLS_VERSION_NUMBER >= 0x030201
+# define DTLS_CIPHERSUITE_HEAD "X-DTLS-CipherSuite: PSK:"
+#else
+# define DTLS_CIPHERSUITE_HEAD "X-DTLS-CipherSuite: "
+#endif
+
 static int start_cstp_connection(struct openconnect_info *vpninfo)
 {
 	struct oc_text_buf *reqbuf;
@@ -253,7 +259,8 @@ static int start_cstp_connection(struct openconnect_info *vpninfo)
 			buf_free(reqbuf);
 			return -EINVAL;
 		}
-		buf_append(reqbuf, "\r\nX-DTLS-CipherSuite: ");
+		buf_append(reqbuf, "\r\n"DTLS_CIPHERSUITE_HEAD);
+
 		if (vpninfo->dtls_ciphers)
 			buf_append(reqbuf, "%s", vpninfo->dtls_ciphers);
 		else

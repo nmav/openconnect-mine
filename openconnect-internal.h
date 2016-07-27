@@ -483,6 +483,7 @@ struct openconnect_info {
 #elif defined(OPENCONNECT_GNUTLS)
 	gnutls_session_t https_sess;
 	gnutls_certificate_credentials_t https_cred;
+	gnutls_psk_client_credentials_t psk_cred;
 	char local_cert_md5[MD5_SIZE * 2 + 1]; /* For CSD */
 	char gnutls_prio[256];
 #ifdef HAVE_TROUSERS

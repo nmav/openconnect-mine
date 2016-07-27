@@ -93,6 +93,7 @@ int RAND_bytes(char *buf, int len)
 #define DTLS_SEND SSL_write
 #define DTLS_RECV SSL_read
 #define DTLS_FREE SSL_free
+#define DTLS_CRED_FREE
 
 /* In the very early days there were cases where this wasn't found in
  * the header files but it did still work somehow. I forget the details
@@ -574,12 +575,144 @@ void append_dtls_ciphers(struct openconnect_info *vpninfo, struct oc_text_buf *b
 #define DTLS_SEND gnutls_record_send
 #define DTLS_RECV gnutls_record_recv
 #define DTLS_FREE gnutls_deinit
+#define DTLS_CRED_FREE if (vpninfo->psk_cred) { \
+			gnutls_psk_free_client_credentials(vpninfo->psk_cred); \
+			vpninfo->psk_cred = NULL; \
+		}
+
+#if GNUTLS_VERSION_NUMBER >= 0x030201
+
+#define PSK_LABEL "EXPORTER-openconnect-psk"
+#define PSK_LABEL_SIZE sizeof(PSK_LABEL)-1
+#define PSK_KEY_SIZE 32
+
+/* This enables a DTLS protocol negotiation. The new negotiation is as follows:
+ * If the client's X-DTLS-CipherSuite contains the PSK keyword, the
+ * server will reply with "X-DTLS-CipherSuite: PSK" and will enable 
+ * DTLS-PSK negotiation on the DTLS channel. The ciphersuite set in the
+ * DTLS channel, must match the one set in TLS one. That, makes the protocol
+ * consistent in security properties (DTLS and TLS channel will match cipher/mac
+ * combinations), and allows the protocol to use new DTLS versions, as well as new
+ * DTLS ciphersuites, as long as they are also used in the TLS channel establishment.
+ *
+ * That change still requires to client to pretend it is resuming by setting in the 
+ * TLS client hello the session ID provided by the X-DTLS-Session-ID header. That is,
+ * because there is no TLS extension we can use to set an identifier in the client
+ * hello (draft-jay-tls-psk-identity-extension could be used in the future).
+ */
+static int start_dtls_psk_handshake(struct openconnect_info *vpninfo, int dtls_fd)
+{
+	gnutls_session_t dtls_ssl;
+	gnutls_datum_t session_id, key;
+	char prio_string[128];
+	int err;
+	gnutls_mac_algorithm_t mac;
+	gnutls_cipher_algorithm_t cipher;
+
+	/* make a priority string based on the cipher/MAC at the TLS connection */
+	cipher = gnutls_cipher_get(vpninfo->https_sess);
+	mac = gnutls_mac_get(vpninfo->https_sess);
+
+	snprintf(prio_string, sizeof(prio_string), "NORMAL:-VERS-ALL:-CIPHER-ALL:-MAC-ALL:-KX-ALL:+VERS-DTLS-ALL:+PSK:+%s:+%s",
+		 gnutls_mac_get_name(mac), gnutls_cipher_get_name(cipher));
+
+	err = gnutls_init(&dtls_ssl, GNUTLS_CLIENT|GNUTLS_DATAGRAM|GNUTLS_NONBLOCK);
+	if (err) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to initialize DTLS: %s\n"),
+			     gnutls_strerror(err));
+		vpninfo->dtls_attempt_period = 0;
+		return -EINVAL;
+	}
+
+	err = gnutls_priority_set_direct(dtls_ssl,
+					 prio_string,
+					 NULL);
+	if (err) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to set DTLS priority: '%s': %s\n"),
+			     prio_string, gnutls_strerror(err));
+		goto fail;
+	}
+
+	gnutls_transport_set_ptr(dtls_ssl,
+				 (gnutls_transport_ptr_t)(intptr_t)dtls_fd);
+
+	/* set PSK credentials */
+	err = gnutls_psk_allocate_client_credentials(&vpninfo->psk_cred);
+	if (err < 0) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to allocate credentials: %s\n"),
+			     gnutls_strerror(err));
+		goto fail;
+	}
+
+	/* generate key */
+	/* we should have used gnutls_prf_rfc5705() but since we don't use
+	 * the RFC5705 context, the output is identical with gnutls_prf(). The
+	 * latter is available in much earlier versions of gnutls. */
+	err = gnutls_prf(vpninfo->https_sess, PSK_LABEL_SIZE, PSK_LABEL,
+			 0, 0, 0, PSK_KEY_SIZE, (char*)vpninfo->dtls_secret);
+	if (err < 0) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to generate DTLS key: %s\n"),
+			     gnutls_strerror(err));
+		goto fail;
+	}
+
+	key.data = vpninfo->dtls_secret;
+	key.size = PSK_KEY_SIZE;
+
+	/* we set an arbitrary username here. We cannot take advantage of the
+	 * username field to send our ID to the server, since the username in TLS-PSK
+	 * is sent after the server-hello. */
+	err = gnutls_psk_set_client_credentials(vpninfo->psk_cred, "psk", &key, 0);
+	if (err < 0) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to set DTLS key: %s\n"),
+			     gnutls_strerror(err));
+		goto fail;
+	}
+
+	session_id.data = vpninfo->dtls_session_id;
+	session_id.size = sizeof(vpninfo->dtls_session_id);
+	err = gnutls_session_set_id(dtls_ssl, &session_id);
+	if (err) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to set DTLS session ID: %s\n"),
+			     gnutls_strerror(err));
+		goto fail;
+	}
+
+	err = gnutls_credentials_set(dtls_ssl, GNUTLS_CRD_PSK, vpninfo->psk_cred);
+	if (err) {
+		vpn_progress(vpninfo, PRG_ERR,
+			     _("Failed to set DTLS PSK credentials: %s\n"),
+			     gnutls_strerror(err));
+		goto fail;
+	}
+
+	vpninfo->dtls_ssl = dtls_ssl;
+	return 0;
+ fail:
+	gnutls_deinit(dtls_ssl);
+	DTLS_CRED_FREE;
+	vpninfo->dtls_attempt_period = 0;
+	return -EINVAL;
+}
+#endif
+
 static int start_dtls_handshake(struct openconnect_info *vpninfo, int dtls_fd)
 {
 	gnutls_session_t dtls_ssl;
 	gnutls_datum_t master_secret, session_id;
 	int err;
 	int cipher;
+
+#if GNUTLS_VERSION_NUMBER >= 0x030201
+	if (strcmp(vpninfo->dtls_cipher, "PSK") == 0)
+		return start_dtls_psk_handshake(vpninfo, dtls_fd);
+#endif
 
 	for (cipher = 0; cipher < sizeof(gnutls_dtls_ciphers)/sizeof(gnutls_dtls_ciphers[0]); cipher++) {
 		if (gnutls_check_version(gnutls_dtls_ciphers[cipher].min_gnutls_version) == NULL)
@@ -590,7 +723,6 @@ static int start_dtls_handshake(struct openconnect_info *vpninfo, int dtls_fd)
 	vpn_progress(vpninfo, PRG_ERR, _("Unknown DTLS parameters for requested CipherSuite '%s'\n"),
 		     vpninfo->dtls_cipher);
 	vpninfo->dtls_attempt_period = 0;
-
 	return -EINVAL;
 
  found_cipher:
@@ -763,6 +895,7 @@ void dtls_close(struct openconnect_info *vpninfo)
 {
 	if (vpninfo->dtls_ssl) {
 		DTLS_FREE(vpninfo->dtls_ssl);
+		DTLS_CRED_FREE;
 		closesocket(vpninfo->dtls_fd);
 		unmonitor_read_fd(vpninfo, dtls);
 		unmonitor_write_fd(vpninfo, dtls);
